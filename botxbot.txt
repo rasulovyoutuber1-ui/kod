@@ -1,0 +1,322 @@
+import asyncio
+import logging
+from typing import Optional, List, Dict, Any, Awaitable, Callable
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.types import (
+    Message, CallbackQuery, TelegramObject,
+    ReplyKeyboardMarkup, InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
+from aiogram.filters import CommandStart, Command
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+import aiosqlite
+
+# ==================== SOZLAMALAR (CONFIG) ====================
+BOT_TOKEN = "8976300424:AAEWb4JiM-gLtguHEUud6wIiJxrfXMJKZFA"
+ADMIN_IDS = [8318241400]  # O'zingizning Telegram ID raqamingizni yozing
+CHANNEL_ID = "-1003852596133"  # Majburiy obuna kanalingiz
+CHANNEL_LINK = "https://t.me/@kagedub1"
+
+
+# ==================== MA'LUMOTLAR BAZASI (DATABASE) ====================
+class Database:
+    def __init__(self, path: str = "bot_database.db"):
+        self.path = path
+
+    async def create_tables(self) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_codes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT,
+                    title TEXT,
+                    description TEXT,
+                    code_text TEXT
+                )
+            """)
+            await db.commit()
+            await self._insert_initial_codes()
+
+    async def _insert_initial_codes(self) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("SELECT COUNT(*) FROM bot_codes") as cursor:
+                count = (await cursor.fetchone())[0]
+                if count > 0:
+                    return
+
+            initial_codes = [
+                ("Kino Bot", "1. Kino Qidirish Boti", "Kod orqali kino topib beruvchi aiogram 3 boti.", "import asyncio\n# Kino bot kodi..."),
+                ("Anime Bot", "2. Anime Izlash Boti", "Anime ro'yxati va qismlarini ko'rsatuvchi bot.", "import aiogram\n# Anime bot kodi..."),
+                ("AI Chat Bot", "3. GPT / Gemini AI Boti", "Sun'iy intellekt bilan ishlovchi yordamchi bot.", "import openai\n# AI bot kodi..."),
+                ("Ob-havo Bot", "4. Ob-havo Ma'lumot Boti", "Shaharlar bo'yicha ob-havoni ko'rsatuvchi bot.", "import requests\n# Ob-havo bot kodi..."),
+                ("Valyuta Bot", "5. Valyuta Kurslari Boti", "Markaziy bank kurslarini taqdim etuvchi bot.", "import aiohttp\n# Valyuta bot kodi..."),
+            ]
+            await db.executemany(
+                "INSERT INTO bot_codes (category, title, description, code_text) VALUES (?, ?, ?, ?)",
+                initial_codes
+            )
+            await db.commit()
+
+    async def add_user(self, user_id: int, username: Optional[str], full_name: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
+                (user_id, username, full_name)
+            )
+            await db.commit()
+
+    async def get_all_codes(self) -> List[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT id, title, description FROM bot_codes") as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_code_by_id(self, code_id: int) -> Optional[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM bot_codes WHERE id = ?", (code_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def count_users(self) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                return (await cur.fetchone())[0]
+
+
+# ==================== KLAVIATURALAR (KEYBOARDS) ====================
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="📂 Botlar Katalogi")
+    builder.button(text="💡 O'z kodini taklif qilish")
+    builder.button(text="ℹ️ Bot haqida")
+    builder.adjust(1)
+    return builder.as_markup(resize_keyboard=True)
+
+def subscription_kb(channel_link: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 Kanalga obuna bo'lish", url=channel_link)
+    builder.button(text="✅ Obunani tekshirish", callback_data="check_subscription")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def codes_list_kb(codes: list) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item in codes:
+        builder.button(text=item["title"], callback_data=f"get_code_{item['id']}")
+    builder.button(text="🔙 Orqaga", callback_data="back_to_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def back_to_catalog_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Katalogga qaytish", callback_data="back_to_catalog")
+    return builder.as_markup()
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Statistika", callback_data="admin_stats")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# ==================== MIDDLEWARE (MAJBURIY OBUNA) ====================
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        bot = data["bot"]
+        user_id = event.from_user.id if event.from_user else None
+
+        if user_id and user_id in ADMIN_IDS:
+            return await handler(event, data)
+
+        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and event.data == "check_subscription":
+            return await handler(event, data)
+
+        try:
+            member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+            if member.status in ["member", "administrator", "creator"]:
+                return await handler(event, data)
+        except Exception:
+            pass
+
+        text = "⚠️ Botdan foydalanish uchun avval rasmiy kanalimizga obuna bo'ling!"
+        markup = subscription_kb(CHANNEL_LINK)
+
+        if isinstance(event, Message):
+            await event.answer(text, reply_markup=markup)
+        elif isinstance(event, CallbackQuery):
+            await event.message.answer(text, reply_markup=markup)
+            await event.answer()
+        return
+
+
+# ==================== ROUTERS & HANDLERS ====================
+router = Router()
+
+class SuggestCode(StatesGroup):
+    waiting_for_code = State()
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, db: Database) -> None:
+    await db.add_user(
+        user_id=message.from_user.id,
+        username=message.from_user.username,
+        full_name=message.from_user.full_name,
+    )
+    text = (
+        f"🤖 Assalomu alaykum, <b>{message.from_user.full_name}</b>!\n\n"
+        "Bu bot orqali siz tayyor va sifatli Telegram botlar kodlarini bepul olishingiz mumkin.\n\n"
+        "Kerakli bo'limni tanlang:"
+    )
+    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "check_subscription")
+async def check_sub(callback: CallbackQuery) -> None:
+    try:
+        member = await callback.bot.get_chat_member(CHANNEL_ID, callback.from_user.id)
+        if member.status in ["member", "administrator", "creator"]:
+            await callback.message.delete()
+            await callback.message.answer("✅ Obuna tasdiqlandi! Asosiy menyu:", reply_markup=main_menu_kb())
+        else:
+            await callback.answer("❌ Siz hali kanalga obuna bo'lmadingiz!", show_alert=True)
+    except Exception:
+        await callback.answer("Xatolik yuz berdi. Qayta urinib ko'ring.", show_alert=True)
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text("Asosiy menyu:", reply_markup=main_menu_kb())
+    await callback.answer()
+
+@router.message(F.text == "📂 Botlar Katalogi")
+async def show_catalog(message: Message, db: Database) -> None:
+    codes = await db.get_all_codes()
+    await message.answer(
+        "📚 <b>Tayyor Botlar Katalogi</b>\n\nQuyidagi ro'yxatdan o'zingizga kerakli bot kodini tanlang:",
+        reply_markup=codes_list_kb(codes),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("get_code_"))
+async def send_bot_code(callback: CallbackQuery, db: Database) -> None:
+    code_id = int(callback.data.split("_")[2])
+    bot_data = await db.get_code_by_id(code_id)
+
+    if not bot_data:
+        await callback.answer("Kod topilmadi!", show_alert=True)
+        return
+
+    text = (
+        f"📌 <b>{bot_data['title']}</b>\n\n"
+        f"📝 <b>Tavsif:</b> {bot_data['description']}\n\n"
+        f"💻 <b>Kod:</b>\n<code>{bot_data['code_text']}</code>"
+    )
+    await callback.message.edit_text(text, reply_markup=back_to_catalog_kb(), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_catalog")
+async def back_to_cat(callback: CallbackQuery, db: Database) -> None:
+    codes = await db.get_all_codes()
+    await callback.message.edit_text(
+        "📚 <b>Tayyor Botlar Katalogi</b>\n\nQuyidagi ro'yxatdan o'zingizga kerakli bot kodini tanlang:",
+        reply_markup=codes_list_kb(codes),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.message(F.text == "💡 O'z kodini taklif qilish")
+async def start_suggest(message: Message, state: FSMContext) -> None:
+    await state.set_state(SuggestCode.waiting_for_code)
+    await message.answer("✍️ Botimiz uchun o'z python kodingizni yoki g'oyangizni yuboring. U adminga jo'natiladi:")
+
+@router.message(SuggestCode.waiting_for_code)
+async def process_suggest(message: Message, state: FSMContext) -> None:
+    suggestion_text = message.text
+    admin_id = ADMIN_IDS[0]
+
+    await message.bot.send_message(
+        admin_id,
+        f"💡 <b>Yangi kod taklifi!</b>\n\nKimdan: @{message.from_user.username or 'yo‘q'} (ID: {message.from_user.id})\n\n{suggestion_text}",
+        parse_mode="HTML"
+    )
+    await state.clear()
+    await message.answer("✅ Taklifingiz adminga yuborildi. Rahmat!", reply_markup=main_menu_kb())
+
+@router.message(F.text == "ℹ️ Bot haqida")
+async def about_bot(message: Message) -> None:
+    await message.answer("🤖 Bu bot foydalanuvchilarga tayyor Telegram bot kodlarini taqdim etish uchun maxsus yaratilgan.")
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message) -> None:
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Siz admin emassiz.")
+        return
+    await message.answer("🛠 <b>Admin Paneli</b>", reply_markup=admin_menu_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery, db: Database) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    total_users = await db.count_users()
+    await callback.message.edit_text(
+        f"📊 <b>Statistika</b>\n\nJami foydalanuvchilar: <b>{total_users} ta</b>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# ==================== MAIN (ISHGA TUSHIRISH) ====================
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_Mode=ParseMode.HTML),
+    )
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+
+    # Database
+    db = Database()
+    await db.create_tables()
+
+    # Dependency Injection
+    dp["db"] = db
+
+    # Middleware
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
+
+    # Router
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🚀 Bot muvaffaqiyatli ishga tushdi!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot to‘xtatildi")
