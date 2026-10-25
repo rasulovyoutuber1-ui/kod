@@ -18,9 +18,9 @@ import aiosqlite
 
 # ==================== SOZLAMALAR (CONFIG) ====================
 BOT_TOKEN = "8976300424:AAEWb4JiM-gLtguHEUud6wIiJxrfXMJKZFA"
-ADMIN_IDS = [8318241400]  # O'zingizning Telegram ID raqamingizni yozing
-CHANNEL_ID = "-1003852596133"  # Majburiy obuna kanalingiz
-CHANNEL_LINK = "https://t.me/@kagedub1"
+ADMIN_IDS = [8318241400]  # Sizning Telegram ID raqamingiz
+CHANNEL_ID = "-1003852596133"  # Majburiy obuna kanalingiz ID raqami
+CHANNEL_LINK = "https://t.me/kagedub1"
 
 
 # ==================== MA'LUMOTLAR BAZASI (DATABASE) ====================
@@ -292,7 +292,8 @@ async def main() -> None:
 
     bot = Bot(
         token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_Mode=ParseMode.HTML),
+        # ⚠️ XATOLIK SHU YERDA EDI: 'parse_Mode' o'rniga to'g'ri yozildi:
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
